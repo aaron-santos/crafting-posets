@@ -253,13 +253,17 @@
 (def cell-types [
     ; ?
     {:ch \? :fg {:r 3 :g 5 :b 5} :bg (db32 :topaz)}
+    {:ch \? :fg {:r 3 :g 5 :b 5} :bg (db32 :topaz)}
     ; !
+    {:ch \! :fg {:r 3 :g 5 :b 5} :bg (db32 :brown)}
     {:ch \! :fg {:r 3 :g 5 :b 5} :bg (db32 :brown)}
     ; +
     {:ch \+ :fg {:r 3 :g 5 :b 5} :bg (db32 :royal-blue)}
     ; &
     {:ch \& :fg {:r 3 :g 5 :b 5} :bg (db32 :tahiti-gold)}
+    {:ch \& :fg {:r 3 :g 5 :b 5} :bg (db32 :tahiti-gold)}
     ; ☼
+    {:ch (char 0x0F) :fg {:r 3 :g 5 :b 5} :bg (db32 :christi)}
     {:ch (char 0x0F) :fg {:r 3 :g 5 :b 5} :bg (db32 :christi)}])
 
 (defn rand-cell []
@@ -277,8 +281,8 @@
         ; ? is always first.
         ; have an even mix of types after that
         types (atom (cons (first cell-types)
-                          (shuffle (take (+ num-nodes (count cell-types))
-                                         (mapcat shuffle (repeat cell-types))))))
+                          (cycle (mapcat shuffle (repeat cell-types)))))
+        seen-complication? (atom false)
         node->row (->> layers
                     (map-indexed vector)
                     (mapcat (fn [[i v]] (repeat v i)))
@@ -323,9 +327,16 @@
   [(for [row c]
      (for [cell row]
        (case cell
-         \N (let [cell (first @types)]
+         \N (loop [cell (first @types)]
               (swap! types rest)
-              cell)
+              (case (= (get cell :cg))
+                \! (do
+                    (reset! seen-complication? true)
+                    cell)
+                \+ (if @seen-complication?
+                    cell
+                    (recur (first @types)))
+                cell))
          {:ch cell :fg {:r 255 :g 255 :b 255} :bg {:r 3 :g 5 :b 5}})))]))
 
 (defn log [layers]
@@ -499,8 +510,12 @@
                         write-xp? progress i]
     (letfn [(gg [] (gen-graph layers params false progress i))]
       (loop [g (gg)]
+        ; select for range of num-nodes
         (if (and (< (* 1.5 (count layers)) (get g :num-nodes) (* 0.8 (reduce + layers)))
-                 (< 1 (reduce + (take-last 4 (get g :e))) 4))
+                 ; make sure the last node has at least 2 connections
+                 (< 1 (reduce + (take-last 4 (get g :e))) 4)
+                 ; make sure there are enough decision points
+                 (< 3 (reduce + (filter #(< 1 %) (get g :e)))))
           (let [path (str "data/params-"
                           (format "%02.2f" (float lambda-b0))
                           "-"
