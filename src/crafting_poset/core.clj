@@ -11,6 +11,7 @@
             [loom.graph :as lg]
             [loom.alg :as la]
             [loom.alg-generic :as lag]
+            [loom.label :as ll]
             [incanter.stats :as is])
   (:import [java.lang Math]
            [mikera.matrixx.decompose Eigen IEigenResult]
@@ -24,6 +25,14 @@
 
 (defn sync-println [& args]
     (locking *out* (apply println args)))
+
+(defn std-dev [x]
+  (case (count x)
+    0 0
+    1 0
+    (let [mean (/ (reduce + x) (count x))]
+      (Math/sqrt (/ (reduce + (map (fn [x] (* (- x mean) (- x mean))) x))
+                  (dec (count x)))))))
 
 (defn rand-weighted
   [m]
@@ -125,7 +134,7 @@
           (m/transpose
             (m/select adj (range prev-row-min prev-row-max)
                           (range prev-col-min prev-col-max)))
-        :default
+        :else
           (sync-println "prior-edges-transposed :default" [prev-rows prev-cols] [rows cols])))
     (m/zero-matrix (- row-max row-min)
                    (- col-max col-min))))
@@ -250,99 +259,149 @@
   :rainforest {:r 143 :g 151 :b 74}
   :stinger {:r 138 :g 111 :b 48}})
 
-(def cell-types [
-    ; ?
-    {:ch \? :fg {:r 3 :g 5 :b 5} :bg (db32 :topaz)}
-    {:ch \? :fg {:r 3 :g 5 :b 5} :bg (db32 :topaz)}
-    ; !
-    {:ch \! :fg {:r 3 :g 5 :b 5} :bg (db32 :brown)}
-    {:ch \! :fg {:r 3 :g 5 :b 5} :bg (db32 :brown)}
-    ; +
-    {:ch \+ :fg {:r 3 :g 5 :b 5} :bg (db32 :royal-blue)}
-    ; &
-    {:ch \& :fg {:r 3 :g 5 :b 5} :bg (db32 :tahiti-gold)}
-    {:ch \& :fg {:r 3 :g 5 :b 5} :bg (db32 :tahiti-gold)}
-    ; ☼
-    {:ch (char 0x0F) :fg {:r 3 :g 5 :b 5} :bg (db32 :christi)}
-    {:ch (char 0x0F) :fg {:r 3 :g 5 :b 5} :bg (db32 :christi)}])
+(def question-cell-type
+  ; ?
+  {:ch \? :fg {:r 3 :g 5 :b 5} :bg (db32 :topaz)})
 
-(defn rand-cell []
-  (rand-nth cell-types))
+(def complication-cell-type
+  ; !
+  {:ch \! :fg {:r 3 :g 5 :b 5} :bg (db32 :brown)})
+
+(def remedy-cell-type
+  ; +
+  {:ch \+ :fg {:r 3 :g 5 :b 5} :bg (db32 :royal-blue)})
+
+(def material-component-cell-type
+  ; &
+  {:ch \& :fg {:r 3 :g 5 :b 5} :bg (db32 :tahiti-gold)})
+
+(def enhancement-cell-type
+  ; ☼
+  {:ch \☼ :fg {:r 3 :g 5 :b 5} :bg (db32 :christi)})
+
+(defn ch->cell-type [ch]
+  (let [m {
+            \? question-cell-type
+            \! complication-cell-type
+            \+ remedy-cell-type
+            \& material-component-cell-type
+            \☼ enhancement-cell-type}]
+    (assert (contains? m ch) (str ch (int ch) "not found in " m))
+    (update (get m ch)
+      :ch
+      (fn [ch]
+        (if (= ch \☼)
+          (char 0xF)
+          ch)))))
+
+(def cell-type-freqs
+  [complication-cell-type
+   remedy-cell-type
+   remedy-cell-type
+   material-component-cell-type
+   enhancement-cell-type])
+
+(defn node->row
+  [layers n]
+  (get
+    (->> layers
+      (map-indexed vector)
+      (mapcat (fn [[i v]] (repeat v i)))
+      (map-indexed vector)
+      (into {}))
+    n))
+
+(defn node->col
+  [layers n]
+  (get
+    (->> layers
+      (mapcat range)
+      (map-indexed vector)
+      (into {}))
+    n))
+
+(defn node-y [layers n]
+  (* 2 (node->row layers n)))
+
+(defn node-x [layers n]
+  (let [row (node->row layers n)
+        col (node->col layers n)
+        max-nodes (reduce max layers)
+        row-num-nodes (get layers row)
+        x (* 2
+             (+ (/ (- max-nodes row-num-nodes) 2)
+                col))]
+    #_(sync-println "row" row "max-nodes" max-nodes "row-num-nodes" row-num-nodes "x" x)
+    (int x)))
+
+(defn paths-contain?
+  [f g source ch n]
+  (f
+    (fn [path]
+      (contains? (set (map (fn [n] (ll/label g n)) path)) ch))
+    (lag/trace-paths
+      (partial lg/predecessors g)
+      n)))
+
+(defn all-paths-contain?
+  [g source ch n]
+  (paths-contain? every?  g source ch n))
+
+(defn any-paths-contain?
+  [g source ch n]
+  (paths-contain? some  g source ch n))
+
+(defn not-any-paths-contain?
+  [g source ch n]
+  (paths-contain? not-any? g source ch n))
 
 (defn draw
-  [g layers]
-  (let [{:keys [adj connections]} g
-        max-nodes (reduce max layers)
+  [labeled-graph layers]
+  (let [max-nodes (reduce max layers)
         width (dec (* 2 (reduce max layers)))
         height (dec (* 2 (count layers)))
-        c (make-array Character/TYPE height width)
-        g (g->loom-graph g)
-        num-nodes (count (lg/nodes g))
-        ; ? is always first.
-        ; have an even mix of types after that
-        types (atom (cons (first cell-types)
-                          (cycle (mapcat shuffle (repeat cell-types)))))
-        seen-complication? (atom false)
-        node->row (->> layers
-                    (map-indexed vector)
-                    (mapcat (fn [[i v]] (repeat v i)))
-                    (map-indexed vector)
-                    (into {}))
-        node->col (->> layers
-                     (mapcat range)
-                     (map-indexed vector)
-                     (into {}))]
+        c (make-array Character/TYPE height width)]
     ;(sync-println edges)
-    ;(sync-println g)
-    (letfn [(node-y [n]
-              (* 2 (get node->row n)))
-            (node-x [n]
-              (let [row (get node->row n)
-                    row-num-nodes (get layers row)
-                    x (* 2
-                         (+ (/ (- max-nodes row-num-nodes) 2)
-                            (node->col n)))]
-                (int x)))]
-      ;; fill canvas with empty chars
-      (doseq [row (range height)
-              col (range width)]
-        (aset-char c row col \space))
-      ;; fill in nodes
-      (doseq [[idx n] (map-indexed vector (lg/nodes g))]
-        ;(sync-println (int (node-y n)) (int (node-x n)) (int (node-x n)))
-        (aset-char c (int (node-y n)) (int (node-x n)) \N))
-      (doseq [[ni nf] (lg/edges g)]
-        (let [xi (node-x ni)
-              yi (node-y ni)
-              xf (node-x nf)
-              yf (node-y nf)]
-          ;(sync-println xi yi xf yf)
-          (cond
-            (= xi xf)
-              (aset-char c (/ (+ yi yf) 2) xi \|)
-            (< xi xf)
-              (aset-char c (/ (+ yi yf) 2) (/ (+ xi xf) 2) \\)
-            (> xi xf)
-              (aset-char c (/ (+ yi yf) 2) (/ (+ xi xf) 2) \/)))))
+    (sync-println labeled-graph)
+    ;; fill canvas with empty chars
+    (doseq [row (range height)
+            col (range width)]
+      (aset-char c row col \space))
+    ;; fill in nodes
+    (doseq [[idx n] (map-indexed vector (lg/nodes labeled-graph))
+            :let [label (ll/label labeled-graph n)]]
+      #_(sync-println "fill node" n label layers (int (node-y layers n)) (int (node-x layers n)))
+      (aset-char c
+        (int (node-y layers n))
+        (int (node-x layers n))
+        (or label \x)))
+
+    ;; fill edges
+    (doseq [[ni nf] (lg/edges labeled-graph)]
+      (let [xi (node-x layers ni)
+            yi (node-y layers ni)
+            xf (node-x layers nf)
+            yf (node-y layers nf)]
+        ;(sync-println xi yi xf yf)
+        (cond
+          (= xi xf)
+            (aset-char c (/ (+ yi yf) 2) xi \|)
+          (< xi xf)
+            (aset-char c (/ (+ yi yf) 2) (/ (+ xi xf) 2) \\)
+          (> xi xf)
+            (aset-char c (/ (+ yi yf) 2) (/ (+ xi xf) 2) \/))))
   [(for [row c]
-     (for [cell row]
-       (case cell
-         \N (loop [cell (first @types)]
-              (swap! types rest)
-              (case (= (get cell :cg))
-                \! (do
-                    (reset! seen-complication? true)
-                    cell)
-                \+ (if @seen-complication?
-                    cell
-                    (recur (first @types)))
-                cell))
-         {:ch cell :fg {:r 255 :g 255 :b 255} :bg {:r 3 :g 5 :b 5}})))]))
+     (do
+     (sync-println "")
+     (for [ch row]
+       (if (contains? #{\x \space \\ \| \/} ch)
+         {:ch ch :fg {:r 255 :g 255 :b 255} :bg {:r 3 :g 5 :b 5}}
+         (ch->cell-type ch)))))]))
 
 (defn log [layers]
-  (doseq [row layers]
+  (doseq [row (get layers 0)]
     (doseq [cell row]
-      (sync-print (or cell \o)))
+      (sync-print (get cell :ch \o)))
     (sync-println))
   layers)
 
@@ -494,6 +553,7 @@
         #_(sync-println "writing" (str path ".xp"))
         (-> g
           (draw layers)
+          log
           (write-xp (str path ".xp"))))
       (-> g
         measure
@@ -505,32 +565,187 @@
                :i i)))
       (catch Exception e (sync-println e))))
 
+(defn color-paths-once
+  ([g] (color-paths-once
+         (lag/trace-paths
+           (partial lg/predecessors g)
+           (reduce max 0 (lg/nodes g)))
+         (clojure.set/difference
+           (set (lg/nodes g))
+           (set (cons (reduce max (lg/nodes g))
+                      (take 4 (sort (lg/nodes g))))))
+         #{}))
+  ([remaining-paths potential-nodes colored-nodes]
+    #_(sync-println "remaining-paths" remaining-paths)
+    (let [potential-nodes (shuffle (vec potential-nodes))]
+      ;; any remaining paths?
+      (if (seq remaining-paths)
+        ; any remaining nodes?
+        (if (seq potential-nodes)
+          ;; pick a node
+          (loop [selected-node (first potential-nodes)
+                 remaining-nodes (next potential-nodes)]
+                  ;; partition remining-paths into those that contain the new node
+                  ;; and those that do not
+            (when selected-node
+              #_(sync-println "selected-node" selected-node)
+              ;; partition remaining paths into paths containing selected node
+              ;; and paths not containing selected node
+              (let [path-groups (group-by (fn [path] (contains? (set path) selected-node))
+                                          remaining-paths)
+                    paths-containing-node (get path-groups true)
+                    paths-without-node (get path-groups false)
+                    nodes-covered-by-new-paths (set (mapcat identity paths-containing-node))
+                    next-potential-nodes (set (clojure.set/difference
+                                            (set potential-nodes)
+                                            nodes-covered-by-new-paths))
+                    #_ (sync-println "nodes-covered-by-new-paths" nodes-covered-by-new-paths)
+                    #_ (sync-println "next-potential-nodes" next-potential-nodes)
+                    result (color-paths-once 
+                             paths-without-node
+                             (shuffle (vec next-potential-nodes))
+                             (conj colored-nodes selected-node))]
+                    (if result
+                      result
+                      (recur (first remaining-nodes) (next remaining-nodes))))))
+          ;; remaining paths but no potential nodes
+          (do
+            #_(sync-println "backtracking")
+            nil))
+        ;; no remaining paths. return colored nodes
+        colored-nodes))))
+
+(defn next-type
+  [types g n & more]
+  (let [preds (lg/predecessors g n)
+        parent-types (clojure.set/union
+                       (set more)
+                       ; parent labels
+                       (set (map (partial ll/label g)
+                                 preds)))]
+    #_(sync-println n "parents" preds)
+    #_(sync-println n "parent-labels" parent-types)
+    (when (< (count parent-types) 4)
+      (loop [c (first @types)]
+        (swap! types rest)
+        (if (contains? parent-types c)
+          (recur (first @types))
+          c)))))
+
+(defn label-graph [g] 
+  (let [selected-nodes (color-paths-once g)
+        min-node (reduce min (lg/nodes g))
+        num-nodes (count (lg/nodes g))
+        ; ? is always first.
+        ; have an even mix of types after that
+        types (atom (cycle (mapcat shuffle (repeat (map :ch cell-type-freqs)))))
+        labeled-graph (reduce (fn [g n]
+                        #_(sync-println n "selected-node?" (contains? selected-nodes n))
+                        (cond
+                          ; root, \?
+                          (= n min-node)
+                            (do
+                              #_(sync-println "labeling root node ?")
+                              (ll/add-label g n \?))
+                          ; selected, \?
+                          (contains? selected-nodes n)
+                            (do
+                              #_(sync-println "labeling selected-node" n)
+                              (ll/add-label g n \?))
+                          ; if paths to root contains \! but not \+
+                          (and
+                            (all-paths-contain? g min-node \! n)
+                            (not-any-paths-contain? g min-node \+ n))
+                            (do
+                              #_(sync-println "labeling ! descendant node" n)
+                              (ll/add-label g n (next-type types g n)))
+                          :else
+                            ; else, label, but not \+
+                            (do
+                              #_(sync-println "labeling" n)
+                              (ll/add-label g n (next-type types g n \+)))))
+                        g
+                        (lg/nodes g))]
+    (sync-println "label-graph selected-nodes" selected-nodes)
+    labeled-graph))
+
 (defn gen-graph-curate [layers
                         [lambda-b0 lambda-b1 lambda-b2 bernoulli-b0 :as params]
                         write-xp? progress i]
-    (letfn [(gg [] (gen-graph layers params false progress i))]
-      (loop [g (gg)]
-        ; select for range of num-nodes
-        (if (and (< (* 1.5 (count layers)) (get g :num-nodes) (* 0.8 (reduce + layers)))
-                 ; make sure the last node has at least 2 connections
-                 (< 1 (reduce + (take-last 4 (get g :e))) 4)
-                 ; make sure there are enough decision points
-                 (< 3 (reduce + (filter #(< 1 %) (get g :e)))))
-          (let [path (str "data/params-"
-                          (format "%02.2f" (float lambda-b0))
-                          "-"
-                          (format "%02.2f" (float lambda-b1))
-                          "-"
-                          (format "%02.2f" (float lambda-b2))
-                          "-"
-                          (format "%02.2f" (float bernoulli-b0))
-                          "-"
-                          i)]
-            (-> (get g :g)
-              (draw layers)
-              (write-xp (str path ".xp")))
-            g)
-          (recur (gg))))))
+  (letfn [(gg [] (gen-graph layers params false progress i))]
+    (loop [g (gg) j 0 k 0]
+
+      ; select graph
+      (if (and (< k 50)
+               (< (* 1.5 (count layers)) (get g :num-nodes 0) (* 0.8 (reduce + layers)))
+               ; make sure the last node has at least 2 connections
+               (< 1 (reduce + (take-last 4 (get g :e))) 4)
+               ; make sure there are enough decision points
+               (< 3 (reduce + (filter #(< 1 %) (get g :e)))))
+        (let [loom-graph (g->loom-graph (get g :g))
+              labeled-graph (label-graph loom-graph)
+              question-nodes (filter (fn [n] (= (ll/label labeled-graph n) \?))
+                                     (lg/nodes labeled-graph))
+              node-labels (map (fn [n] (ll/label labeled-graph n))
+                                (sort (vec (lg/nodes labeled-graph))))
+              node-freqs (frequencies
+                           node-labels)]
+
+          (sync-println "i" i "j" j "k" k)
+          (sync-println "question-nodes" question-nodes)
+          #_(sync-println "min-question" (reduce min question-nodes))
+          #_(sync-println "max-question" (reduce max question-nodes))
+          #_(sync-println "sum-question" (reduce + 0 question-nodes))
+          #_(sync-println "max-nodes" (* 0.8 (reduce + layers)))
+     
+          #_(log (draw labeled-graph layers))
+
+          ;; select coloring
+          (if (and
+                ;; no nil labels
+                (not-any? nil? node-labels)
+                ;; question node count and dispersion
+                (or (= 1 (count question-nodes))
+                    (< 1 (std-dev (map (partial node-y layers)
+                                       (rest (sort question-nodes))))))
+                ;; question node toward top
+                (< (/ (reduce + 0 question-nodes)
+                      (count question-nodes))
+                   (* 0.5 (count node-labels)))
+                ;; at least one of each node type present
+                (< 4 (count (keys node-freqs)))
+                ;; not too many siblings of same type
+                (< (reduce +
+                     ; count of duplicate children for each node
+                     (mapcat (fn [n]
+                               ; how many duplicate children for node n
+                               (let [children-labels (cons (ll/label labeled-graph n)
+                                                           (map (partial ll/label labeled-graph)
+                                                             (lg/successors loom-graph n)))]
+                                 (remove (partial = 1)
+                                         (vals (frequencies children-labels)))))
+                             (lg/nodes labeled-graph)))
+                   (* 0.15 (count node-labels))))
+            (let [path (str "data/params-"
+                            (format "%02.2f" (float lambda-b0))
+                            "-"
+                            (format "%02.2f" (float lambda-b1))
+                            "-"
+                            (format "%02.2f" (float lambda-b2))
+                            "-"
+                            (format "%02.2f" (float bernoulli-b0))
+                            "-"
+                            i
+                            "-"
+                            j
+                            "-"
+                            k)]
+              (-> labeled-graph
+                (draw layers)
+                (write-xp (str path ".xp")))
+              g)
+            (recur g j (inc k))))
+        (recur (gg) (inc j) 0)))))
 
 (defn descent [f xs error rate epochs]
   (let [ns (range (count xs))
